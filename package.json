@@ -1,0 +1,15 @@
+{
+  "name": "app-call-center-telemercadeo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CRM de Telemercadeo: Jefe de Telemercadeo y Promotores",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --no-warnings server.js",
+    "seed": "node --no-warnings scripts/seed.js"
+  },
+  "engines": { "node": ">=22.13" },
+  "dependencies": {
+    "xlsx": "0.18.5"
+  }
+}
