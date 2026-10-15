@@ -1,5 +1,10 @@
-// Lectura de archivos Excel (Tabla Madre / Bases) y normalización de columnas
-const XLSX = require('xlsx');
+// Lectura de archivos Excel (Tabla Madre / Bases) y normalización de columnas.
+// Funciona en el navegador (window.Importer) y en Node (require).
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory(require('xlsx'));
+  else root.Importer = factory(root.XLSX);
+})(typeof self !== 'undefined' ? self : this, function (XLSX) {
+'use strict';
 
 const norm = (s) => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '')
   .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
@@ -80,7 +85,8 @@ function pickSheet(wb, preferidas) {
 }
 
 function readRows(buffer, preferidas, colMap) {
-  const wb = XLSX.read(buffer, { type: 'buffer', cellDates: true });
+  const tipo = typeof Buffer !== 'undefined' && Buffer.isBuffer(buffer) ? 'buffer' : 'array';
+  const wb = XLSX.read(buffer, { type: tipo, cellDates: true });
   const sheet = pickSheet(wb, preferidas);
   const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheet], { header: 1, raw: true, defval: null });
   if (!rows.length) return { sheet, rows: [], columnas: [] };
@@ -122,4 +128,5 @@ function parseBases(buffer, catalogos) {
   return { sheet, columnas, bases };
 }
 
-module.exports = { parseLeads, parseBases, norm, XLSX };
+return { parseLeads, parseBases, norm };
+});

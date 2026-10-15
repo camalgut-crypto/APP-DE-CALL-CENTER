@@ -23,6 +23,7 @@ const usd = (n) => (n == null || isNaN(n) ? '—' : '$ ' + Math.round(n).toLocal
 const int = (n) => (n == null || isNaN(n) ? '—' : Math.round(n).toLocaleString('en-US'));
 const dec = (n, d = 1) => (n == null || isNaN(n) ? '—' : Number(n).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d }));
 const pct = (n) => (n == null || !isFinite(n) ? '—' : (n * 100).toFixed(1) + '%');
+const fdt = (s) => (s ? new Date(s).toLocaleString('es-NI', { dateStyle: 'short', timeStyle: 'short' }) : '');
 const fdate = (s) => (s ? s.slice(8, 10) + '/' + s.slice(5, 7) + '/' + s.slice(0, 4) : '');
 const MESES = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
 const nombrePeriodo = (p) => (p ? `${MESES[Number(p.slice(5)) - 1]} ${p.slice(0, 4)}` : '');
@@ -33,12 +34,43 @@ const isJefe = () => S.me && S.me.rol === 'jefe';
 const sum = (arr, f) => arr.reduce((a, x) => a + (Number(f(x)) || 0), 0);
 const norm = (s) => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
 
-async function api(method, url, body) {
-  const r = await fetch(url, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
-  if (r.status === 401 && !url.endsWith('/login')) { S.me = null; renderLogin('Su sesión expiró, ingrese de nuevo'); throw new Error('Sesión expirada'); }
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || 'Error ' + r.status);
+// ================= Acceso a datos (Supabase) =================
+const CFG = window.CRM_CONFIG || {};
+const sb = CFG.SUPABASE_URL && !/TU_PROYECTO/.test(CFG.SUPABASE_URL) && window.supabase
+  ? window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY) : null;
+const DOMINIO = '@telemercadeo.example';
+const periodoActual = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; };
+
+// Ejecuta una consulta y convierte el error de Supabase en una excepción con mensaje legible
+async function q(promesa) {
+  const { data, error } = await promesa;
+  if (error) {
+    if (/JWT|session/i.test(error.message)) { S.me = null; renderLogin('Su sesión expiró, ingrese de nuevo'); throw new Error('Sesión expirada'); }
+    throw new Error(error.message.replace(/^.*?ERROR:\s*/, ''));
+  }
   return data;
+}
+// Supabase devuelve máximo 1000 filas por consulta: se pide por páginas
+async function fetchAll(builder) {
+  const out = []; const page = 1000;
+  for (let from = 0; ; from += page) {
+    const rows = await q(builder().range(from, from + page - 1));
+    out.push(...rows); if (rows.length < page) return out;
+  }
+}
+const chunks = (arr, n) => Array.from({ length: Math.ceil(arr.length / n) }, (_, i) => arr.slice(i * n, i * n + n));
+const nombreDe = (id) => (S.me && id === S.me.id ? S.me.nombre : S.promotores.find((p) => p.id === id)?.nombre) || null;
+const conNombre = (rows) => rows.map((r) => ({ ...r, promotor: nombreDe(r.promotor_id) }));
+// Limpia valores del formulario: '' -> null, números
+function limpiar(obj) {
+  const o = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === undefined) continue;
+    if (v === '' || v === null) { o[k] = null; continue; }
+    if (['monto', 'salario'].includes(k)) { const n = Number(v); if (isNaN(n)) throw new Error('Valor inválido en ' + k); o[k] = n; continue; }
+    o[k] = typeof v === 'string' ? v.trim() : v;
+  }
+  return o;
 }
 function toast(msg, tipo = '') {
   const t = document.createElement('div'); t.className = 'toast ' + tipo; t.textContent = msg;
@@ -83,22 +115,48 @@ function renderLogin(msg = '') {
   $('#lu').focus();
   $('#fLogin').onsubmit = async (e) => {
     e.preventDefault();
-    try { await api('POST', '/api/login', { username: $('#lu').value, password: $('#lp').value }); await boot(); }
-    catch (err) { $('#lerr').textContent = err.message; }
+    const btn = e.target.querySelector('button'); btn.disabled = true;
+    try {
+      const u = $('#lu').value.trim().toLowerCase();
+      const { error } = await sb.auth.signInWithPassword({ email: u.includes('@') ? u : u + DOMINIO, password: $('#lp').value });
+      if (error) throw new Error(/invalid/i.test(error.message) ? 'Usuario o contraseña incorrectos' : error.message);
+      await boot();
+    } catch (err) { $('#lerr').textContent = err.message; btn.disabled = false; }
   };
 }
 
+async function cargarPerfil() {
+  const { data: { session } } = await sb.auth.getSession();
+  if (!session) return false;
+  const perfil = await q(sb.from('perfiles').select('*').eq('id', session.user.id).maybeSingle());
+  if (!perfil || !perfil.activo) { await sb.auth.signOut(); throw new Error('Su usuario está inactivo o no tiene perfil asignado. Consulte al Jefe de Telemercadeo.'); }
+  const [cat, promotores, periodos] = await Promise.all([
+    q(sb.from('catalogos').select('tipo,valor').order('tipo').order('orden')),
+    perfil.rol === 'jefe' ? q(sb.from('perfiles').select('id,nombre,username,activo').eq('rol', 'promotor').order('nombre')) : [],
+    q(sb.rpc('periodos')),
+  ]);
+  S.me = perfil;
+  S.cat = {}; for (const r of cat) (S.cat[r.tipo] ||= []).push(r.valor);
+  S.promotores = perfil.rol === 'jefe' ? promotores : [{ id: perfil.id, nombre: perfil.nombre, username: perfil.username, activo: true }];
+  S.periodos = periodos.map((p) => (typeof p === 'string' ? p : p.periodos));
+  if (!S.periodos.includes(periodoActual())) S.periodos.unshift(periodoActual());
+  S.periodos.sort().reverse();
+  return true;
+}
 async function boot() {
+  if (!sb) {
+    $('#app').innerHTML = `<div class="login-wrap"><div class="login"><h1>Configuración pendiente</h1>
+      <p>Falta conectar la base de datos: complete <code>public/config.js</code> con la URL y la clave pública de Supabase.</p></div></div>`;
+    return;
+  }
   try {
-    const me = await api('GET', '/api/me');
-    Object.assign(S, { me: me.user, cat: me.catalogos, promotores: me.promotores, periodos: me.periodos });
-    if (!S.periodo || !S.periodos.includes(S.periodo)) S.periodo = S.periodos.find((p) => p) || '';
-    // Mostrar el periodo más reciente con datos si el actual está vacío
+    if (!(await cargarPerfil())) return renderLogin();
+    if (!S.periodo || !S.periodos.includes(S.periodo)) S.periodo = S.periodos[0];
     S.tab = S.tab || 'base';
     renderShell();
     await loadTab();
     if (S.me.must_change) cambiarClave(true);
-  } catch (e) { if (e.message !== 'Sesión expirada') renderLogin(); }
+  } catch (e) { if (e.message !== 'Sesión expirada') renderLogin(e.message); }
 }
 
 // ================= Shell y pestañas =================
@@ -125,8 +183,8 @@ function renderShell() {
   </div><nav class="tabs" id="tabs"></nav></header><main id="content"></main>`;
   renderTabs();
   $('#selPer').onchange = async (e) => { S.periodo = e.target.value; S.gestion = null; if (S.tab === 'gestion') S.tab = 'base'; renderTabs(); await loadTab(); };
-  $('#btnExport').onclick = () => { location.href = '/api/export?periodo=' + S.periodo; };
-  $('#lnkOut').onclick = async (e) => { e.preventDefault(); await api('POST', '/api/logout').catch(() => {}); S.me = null; S.gestion = null; S.tab = ''; renderLogin(); };
+  $('#btnExport').onclick = () => exportarExcel().catch(fail);
+  $('#lnkOut').onclick = async (e) => { e.preventDefault(); await sb.auth.signOut().catch(() => {}); S.me = null; S.gestion = null; S.tab = ''; renderLogin(); };
   $('#lnkPass').onclick = (e) => { e.preventDefault(); cambiarClave(false); };
   if ($('#btnPer')) $('#btnPer').onclick = nuevoPeriodo;
 }
@@ -154,33 +212,70 @@ async function cambiarClave(obligatorio) {
     <div class="field"><label>Repetir nueva contraseña</label><input type="password" id="pn2" autocomplete="new-password"></div>`,
   [...(obligatorio ? [] : [{ label: 'Cancelar' }]), { label: 'Guardar', cls: 'primary', onClick: async (r) => {
     if ($('#pn', r).value !== $('#pn2', r).value) throw new Error('Las contraseñas no coinciden');
-    await api('POST', '/api/password', { actual: $('#pa', r).value, nueva: $('#pn', r).value });
+    const nueva = $('#pn', r).value;
+    if (nueva.length < 8) throw new Error('La nueva contraseña debe tener al menos 8 caracteres');
+    if (nueva !== $('#pn2', r).value) throw new Error('Las contraseñas no coinciden');
+    const { error: e1 } = await sb.auth.signInWithPassword({ email: S.me.username + DOMINIO, password: $('#pa', r).value });
+    if (e1) throw new Error('La contraseña actual no es correcta');
+    const { error: e2 } = await sb.auth.updateUser({ password: nueva });
+    if (e2) throw new Error(e2.message);
+    await q(sb.rpc('marcar_clave_cambiada'));
     S.me.must_change = false; toast('Contraseña actualizada', 'ok');
   } }]);
 }
 
 // ================= Carga de datos =================
-async function loadLeads() { S.leads = await api('GET', `/api/leads?periodo=${S.periodo}`); }
-async function loadBases() { S.bases = await api('GET', `/api/bases?periodo=${S.periodo}`); }
-async function loadProd() { S.prod = await api('GET', `/api/produccion?periodo=${S.periodo}`); }
-async function loadMetas() { S.metas = await api('GET', `/api/metas/${S.periodo}`); }
+const ORDEN_LEADS = (b) => b.order('fecha_asignacion', { ascending: false, nullsFirst: false }).order('hora', { ascending: false }).order('id', { ascending: false });
+async function loadLeads() { S.leads = conNombre(await fetchAll(() => ORDEN_LEADS(sb.from('leads').select('*').eq('periodo', S.periodo)))); }
+async function loadBases() { S.bases = conNombre(await fetchAll(() => sb.from('bases').select('*').eq('periodo', S.periodo).order('tipo_base').order('id'))); }
+// Producción = todo lo formalizado en la base del mes y en Bases
+function loadProd() {
+  const L = S.leads.filter((l) => l.estado === 'Formalizado').map((l) => ({ origen: 'lead', id: l.id, promotor_id: l.promotor_id, promotor: l.promotor,
+    fecha_asignacion: l.fecha_asignacion, cedula: l.cedula_lead || l.cedula, campana: l.campana, perfil: l.perfil_lead, tipificacion: l.tipificacion,
+    estado: l.estado, monto: Number(l.monto) || 0, fecha_formalizado: l.fecha_formalizado, seguro: l.seguro, comentario: l.comentarios }));
+  const B = S.bases.filter((b) => b.estado === 'Formalizado').map((b) => ({ origen: 'base', id: b.id, promotor_id: b.promotor_id, promotor: b.promotor,
+    fecha_asignacion: null, cedula: b.cedula, campana: 'Base ' + (b.tipo_base || ''), perfil: b.tipo_credito_patrono, tipificacion: b.tipificacion,
+    estado: b.estado, monto: Number(b.monto) || 0, fecha_formalizado: b.fecha_formalizado, seguro: b.seguro, comentario: b.comentario }));
+  S.prod = [...L, ...B].sort((a, b) => String(b.fecha_formalizado || '').localeCompare(String(a.fecha_formalizado || '')));
+}
+async function loadMetas() {
+  S.metas = (await q(sb.from('metas').select('*').eq('periodo', S.periodo).maybeSingle()))
+    || { periodo: S.periodo, meta_mensual: 0, dias_habiles: null, dias_fecha: null, tipo_cambio: 36.6243, conversion: 0.026, campanas: [] };
+  for (const k of ['meta_mensual', 'dias_habiles', 'dias_fecha', 'tipo_cambio', 'conversion']) if (S.metas[k] != null) S.metas[k] = Number(S.metas[k]);
+}
+
+async function exportarExcel() {
+  if (!S.leads.length) await loadLeads();
+  if (!S.bases.length) await loadBases();
+  const hoja = MESES[Number(S.periodo.slice(5)) - 1].toUpperCase();
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(S.leads.map((l) => ({ 'Fecha asignacion': l.fecha_asignacion, Hora: l.hora, 'Cédula': l.cedula,
+    'Número Celular': l.celular, Correo: l.correo, 'Campaña': l.campana, Asesor: l.promotor, 'Cedula Lead': l.cedula_lead, 'Perfil Lead': l.perfil_lead,
+    Tipificacion: l.tipificacion, Estado: l.estado, 'Monto Colocado': l.monto == null ? null : Number(l.monto), 'Fecha formalizado': l.fecha_formalizado,
+    Seguro: l.seguro, Comentarios: l.comentarios }))), hoja);
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(S.bases.map((b) => ({ BASE_PRECALIFICADOS: b.tipo_base, CEDULA: b.cedula, NOMBRE: b.nombre,
+    TELEFONO: b.telefono, CORREO: b.correo, TIPO_CREDITO_PATRONO: b.tipo_credito_patrono, Salario: b.salario == null ? null : Number(b.salario),
+    HIT_PFORMALIZACION: b.hit, Razon_no_aplica: b.razon_no_aplica, 'Tipificación': b.tipificacion, Estado: b.estado, Monto: b.monto == null ? null : Number(b.monto),
+    COMENTARIO: b.comentario, Asesor: b.promotor }))), 'BASES');
+  XLSX.writeFile(wb, `Telemercadeo_${hoja}_${S.periodo.slice(0, 4)}${isJefe() ? '' : '_' + S.me.username}.xlsx`);
+}
 async function loadTab() {
   $('#content').innerHTML = '<div class="empty">Cargando…</div>';
   try {
     const t = S.tab;
     const tareas = [];
-    if (['base', 'tablas', 'campanas', 'dinamica', 'desfase', 'distribucion', 'gestion'].includes(t)) tareas.push(loadLeads());
-    if (['bases', 'distribucion', 'gestion', 'desfase'].includes(t)) tareas.push(loadBases());
-    if (['produccion', 'desfase', 'tablas'].includes(t)) tareas.push(loadProd());
+    if (['base', 'tablas', 'campanas', 'dinamica', 'desfase', 'distribucion', 'gestion', 'produccion'].includes(t)) tareas.push(loadLeads());
+    if (['bases', 'distribucion', 'gestion', 'desfase', 'produccion', 'tablas'].includes(t)) tareas.push(loadBases());
     if (t === 'desfase') tareas.push(loadMetas());
     await Promise.all(tareas);
-    renderContent();
+    loadProd();
+    await renderContent();
   } catch (e) { if (e.message !== 'Sesión expirada') { $('#content').innerHTML = `<div class="empty">${esc(e.message)}</div>`; } }
 }
 function renderContent() {
   const views = { base: viewBase, gestion: viewGestion, produccion: viewProduccion, bases: viewBases, desfase: viewDesfase, tablas: viewTablas,
     campanas: viewCampanas, dinamica: viewDinamica, distribucion: viewDistribucion, config: viewConfig };
-  (views[S.tab] || viewBase)();
+  return (views[S.tab] || viewBase)();
 }
 
 // ================= Base del mes (OCTUBRE) =================
@@ -271,8 +366,8 @@ async function nuevoLead() {
     <div class="field full"><label>Ejecutivo asignado</label><select id="np">${opts(S.promotores.filter((p) => p.activo).map((p) => [p.id, p.nombre]), '', '— Sin asignar —')}</select></div></div>`,
   [{ label: 'Cancelar' }, { label: 'Crear', cls: 'primary', onClick: async (r) => {
     if (!$('#nc', r).value && !$('#ncel', r).value) throw new Error('Indique cédula o celular');
-    await api('POST', '/api/leads', { periodo: S.periodo, fecha_asignacion: $('#nf', r).value, hora: $('#nh', r).value, cedula: $('#nc', r).value,
-      celular: $('#ncel', r).value, correo: $('#nco', r).value, campana: $('#ncam', r).value, promotor_id: $('#np', r).value || null });
+    await q(sb.from('leads').insert(limpiar({ periodo: S.periodo, fecha_asignacion: $('#nf', r).value, hora: $('#nh', r).value, cedula: $('#nc', r).value,
+      celular: $('#ncel', r).value, correo: $('#nco', r).value, campana: $('#ncam', r).value, promotor_id: $('#np', r).value })));
     toast('Lead creado', 'ok'); await loadLeads(); viewBase();
   } }]);
 }
@@ -332,7 +427,7 @@ function viewGestion() {
   <div class="gestion">
     <div class="card datos"><div class="card-h verde"><h3>${esLead ? 'Datos del lead (asignación)' : 'Datos del precalificado'}</h3></div>
       <div class="card-b">${datos}<div class="contact">${telLinks(esLead ? r.celular : r.telefono)}${(esLead ? r.correo : r.correo) ? `<a class="btn sm" href="mailto:${esc(r.correo)}">✉ Correo</a>` : ''}</div></div></div>
-    <div class="card"><div class="card-h azul"><h3>Gestión del promotor</h3><div class="spacer"></div><span class="small muted">${r.updated_at ? 'Última actualización: ' + esc(r.updated_at) : 'Sin gestión registrada'}</span></div>
+    <div class="card"><div class="card-h azul"><h3>Gestión del promotor</h3><div class="spacer"></div><span class="small muted">${r.updated_at ? 'Última actualización: ' + esc(fdt(r.updated_at)) : 'Sin gestión registrada'}</span></div>
       <div class="card-b"><form id="fGest" class="form-grid">
         ${esLead ? `<div class="field"><label>Cédula lead</label>${inp('g_cedula_lead', r.cedula_lead)}</div>
         <div class="field"><label>Perfil lead</label>${sel('g_perfil_lead', S.cat.perfil, r.perfil_lead)}</div>` : ''}
@@ -362,10 +457,11 @@ function viewGestion() {
       : ['tipificacion', 'estado', 'monto', 'fecha_formalizado', 'seguro', 'comentarios'];
     const body = {};
     for (const c of campos) { const el = $('#g_' + c); if (el) body[c === 'comentarios' && !esLead ? 'comentario' : c] = el.value; }
-    const upd = await api('PUT', `/api/${esLead ? 'leads' : 'bases'}/${r.id}`, body);
+    const datos = limpiar(body);
+    if (datos.estado === 'Formalizado' && !(datos.monto > 0)) throw new Error('Para marcar "Formalizado" debe indicar el monto colocado');
+    const upd = await q(sb.from(esLead ? 'leads' : 'bases').update(datos).eq('id', r.id).select().single());
     const list = esLead ? S.leads : S.bases; const i = list.findIndex((x) => x.id === r.id);
-    const prom = S.promotores.find((p) => p.id === upd.promotor_id);
-    list[i] = { ...upd, promotor: prom ? prom.nombre : (isJefe() ? null : S.me.nombre) };
+    list[i] = { ...upd, promotor: nombreDe(upd.promotor_id) };
     toast('Gestión guardada', 'ok');
   };
   $('#fGest').onsubmit = async (e) => { e.preventDefault(); try { await guardar(); viewGestion(); } catch (err) { fail(err); } };
@@ -380,14 +476,14 @@ function viewGestion() {
   };
   if ($('#gDel')) $('#gDel').onclick = async () => {
     if (!(await confirmar('Eliminar lead', `¿Eliminar definitivamente el lead <b>${esc(r.cedula || r.celular)}</b>?`))) return;
-    try { await api('DELETE', '/api/leads/' + r.id); S.leads = S.leads.filter((x) => x.id !== r.id); S.gestion = null; S.tab = 'base'; renderTabs(); renderContent(); toast('Lead eliminado'); } catch (e) { fail(e); }
+    try { await q(sb.from('leads').delete().eq('id', r.id)); S.leads = S.leads.filter((x) => x.id !== r.id); S.gestion = null; S.tab = 'base'; renderTabs(); renderContent(); toast('Lead eliminado'); } catch (e) { fail(e); }
   };
   $('#gHist').ontoggle = async () => {
     if (!$('#gHist').open) return;
     try {
-      const h = await api('GET', `/api/historial/${esLead ? 'leads' : 'bases'}/${r.id}`);
-      $('#gHistList').innerHTML = h.length ? h.map((x) => { const c = JSON.parse(x.cambios);
-        return `<li><b>${esc(x.at)}</b> · ${esc(x.nombre || '')}: ${Object.keys(c.despues).map((k) => `${esc(k)}: <s>${esc(c.antes[k] ?? '∅')}</s> → ${esc(c.despues[k] ?? '∅')}`).join('; ')}</li>`; }).join('')
+      const h = await q(sb.from('historial').select('*').eq('entidad', esLead ? 'leads' : 'bases').eq('entidad_id', r.id).order('id', { ascending: false }));
+      $('#gHistList').innerHTML = h.length ? h.map((x) => { const c = x.cambios;
+        return `<li><b>${esc(fdt(x.at))}</b> · ${esc(nombreDe(x.user_id) || (isJefe() ? '' : 'Jefe'))}: ${Object.keys(c.despues).map((k) => `${esc(k)}: <s>${esc(c.antes[k] ?? '∅')}</s> → ${esc(c.despues[k] ?? '∅')}`).join('; ')}</li>`; }).join('')
         : '<li class="muted">Sin cambios registrados.</li>';
     } catch (e) { fail(e); }
   };
@@ -562,7 +658,10 @@ function viewDesfase() {
   };
   const guardar = async (cambio) => {
     const body = leerForm(); if (cambio) cambio(body);
-    try { await api('PUT', '/api/metas/' + S.periodo, body); await loadMetas(); viewDesfase(); toast('Parámetros guardados', 'ok'); } catch (e) { fail(e); }
+    const num = (v) => (v === '' || v == null ? null : Number(v));
+    const fila = { periodo: S.periodo, meta_mensual: num(body.meta_mensual) || 0, dias_habiles: num(body.dias_habiles), dias_fecha: num(body.dias_fecha),
+      tipo_cambio: num(body.tipo_cambio) || 36.6243, conversion: num(body.conversion) ?? 0.026, campanas: body.campanas };
+    try { await q(sb.from('metas').upsert(fila)); await loadMetas(); viewDesfase(); toast('Parámetros guardados', 'ok'); } catch (e) { fail(e); }
   };
   $('#mSave').onclick = () => guardar();
   $('#mAddC').onclick = () => guardar((b) => b.campanas.push({ campana: 'Nueva', leads_requeridos: 0, ticket_esperado: 0 }));
@@ -749,48 +848,71 @@ function viewDistribucion() {
   $('#dVer').onchange = (e) => { d.ver = e.target.value; re(); };
   $('#dCamp').onchange = (e) => { d.campana = e.target.value; re(); };
   $('#dQ').onchange = (e) => { d.q = e.target.value; re(); };
-  $('#content').querySelectorAll('[data-prom]').forEach((c) => c.onchange = () => { const id = Number(c.dataset.prom); c.checked ? d.prom.add(id) : d.prom.delete(id); re(); });
+  $('#content').querySelectorAll('[data-prom]').forEach((c) => c.onchange = () => { const id = c.dataset.prom; c.checked ? d.prom.add(id) : d.prom.delete(id); re(); });
   $('#content').querySelectorAll('[data-sel]').forEach((c) => c.onchange = () => { const id = Number(c.dataset.sel); c.checked ? d.sel.add(id) : d.sel.delete(id); re(); });
   $('#dAll').onchange = (e) => { rows.forEach((r) => (e.target.checked ? d.sel.add(r.id) : d.sel.delete(r.id))); re(); };
   const ep = esLeads ? 'leads' : 'bases';
   const recargar = async () => { d.sel.clear(); await (esLeads ? loadLeads() : loadBases()); re(); };
+  // Asigna en bloques (la URL de la consulta no admite miles de ids a la vez)
+  const asignar = async (ids, pid) => { for (const c of chunks(ids, 150)) await q(sb.from(ep).update({ promotor_id: pid }).in('id', c)); };
   $('#dRep').onclick = async () => {
     try {
-      const r = await api('POST', `/api/${ep}/distribuir`, { ids: [...d.sel], promotor_ids: [...d.prom], periodo: S.periodo });
-      toast('Repartido: ' + Object.entries(r.resumen).map(([id, n]) => `${S.promotores.find((p) => p.id === Number(id))?.nombre} ${n}`).join(', '), 'ok'); await recargar();
+      // Reparto equitativo: cada registro va al promotor con menos carga en el periodo
+      const cargaAct = new Map([...d.prom].map((p) => [p, src.filter((r) => r.promotor_id === p && !d.sel.has(r.id)).length]));
+      const plan = new Map([...d.prom].map((p) => [p, []]));
+      for (const id of d.sel) {
+        let min = null; for (const [p, n] of cargaAct) if (min === null || n < cargaAct.get(min)) min = p;
+        plan.get(min).push(id); cargaAct.set(min, cargaAct.get(min) + 1);
+      }
+      for (const [p, ids] of plan) if (ids.length) await asignar(ids, p);
+      toast('Repartido: ' + [...plan].filter(([, ids]) => ids.length).map(([p, ids]) => `${nombreDe(p)} ${ids.length}`).join(', '), 'ok'); await recargar();
     } catch (e) { fail(e); }
   };
   $('#dAsig').onclick = async () => {
     const to = $('#dTo').value; if (!to) return toast('Elija el promotor en "Asignar a…"', 'error');
-    try { await api('POST', `/api/${ep}/asignar`, { ids: [...d.sel], promotor_id: Number(to) }); toast(`${d.sel.size} registros asignados`, 'ok'); await recargar(); } catch (e) { fail(e); }
+    try { await asignar([...d.sel], to); toast(`${d.sel.size} registros asignados`, 'ok'); await recargar(); } catch (e) { fail(e); }
   };
   $('#dQuitar').onclick = async () => {
     if (!(await confirmar('Quitar asignación', `Los ${d.sel.size} registros quedarán sin ejecutivo. ¿Continuar?`))) return;
-    try { await api('POST', `/api/${ep}/asignar`, { ids: [...d.sel], promotor_id: null }); await recargar(); } catch (e) { fail(e); }
+    try { await asignar([...d.sel], null); await recargar(); } catch (e) { fail(e); }
   };
   $('#dImp').onclick = async () => {
     const file = $('#dFile').files[0]; if (!file) return toast('Seleccione un archivo Excel', 'error');
     const repl = esLeads && $('#dRepl').checked;
     if (repl && !(await confirmar('Reemplazar base', `Se eliminarán los <b>${S.leads.length}</b> leads de ${esc(nombrePeriodo(S.periodo))} y sus gestiones antes de importar. ¿Continuar?`))) return;
+    const btn = $('#dImp'); btn.disabled = true; btn.textContent = 'Importando…';
     try {
-      const buf = new Uint8Array(await file.arrayBuffer()); let bin = '';
-      for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
-      const body = { periodo: S.periodo, data: btoa(bin), reemplazar: repl };
-      if (!esLeads && $('#dImpProm').value) body.promotor_id = Number($('#dImpProm').value);
-      const r = await api('POST', `/api/import/${ep}`, body);
-      let msg = `Hoja "${r.hoja}": ${r.importados} registros importados.`;
-      if (r.sin_promotor) msg += ` ${r.sin_promotor} quedaron sin asignar.`;
-      if (r.promotores_no_encontrados?.length) msg += ` Asesores no encontrados: ${r.promotores_no_encontrados.join(', ')} (créelos en Usuarios).`;
+      const buf = new Uint8Array(await file.arrayBuffer());
+      const buscar = (nombre) => {
+        if (!nombre) return null; const k = norm(nombre).trim();
+        const p = S.promotores.find((x) => norm(x.nombre) === k || norm(x.username) === k) || S.promotores.find((x) => !k.includes(' ') && norm(x.nombre).split(' ')[0] === k);
+        return p ? p.id : null;
+      };
+      let filas, hoja; const noEnc = new Set(); let sinProm = 0;
+      if (esLeads) {
+        const r = Importer.parseLeads(buf, S.cat); hoja = r.sheet;
+        if (!r.columnas.includes('cedula') && !r.columnas.includes('celular')) throw new Error(`La hoja "${r.sheet}" no tiene columnas de Cédula o Celular`);
+        filas = r.leads.map(({ promotor, ...l }) => { const pid = buscar(promotor); if (!pid) { sinProm++; if (promotor) noEnc.add(promotor); } return { ...l, periodo: S.periodo, promotor_id: pid }; });
+      } else {
+        const r = Importer.parseBases(buf, S.cat); hoja = r.sheet; const fijo = $('#dImpProm').value || null;
+        filas = r.bases.map(({ promotor, ...b }) => ({ ...b, periodo: S.periodo, promotor_id: fijo || buscar(promotor) }));
+      }
+      if (!filas.length) throw new Error(`La hoja "${hoja}" no tiene registros para importar`);
+      if (repl) await q(sb.from('leads').delete().eq('periodo', S.periodo));
+      for (const c of chunks(filas, 500)) await q(sb.from(ep).insert(c));
+      let msg = `Hoja "${hoja}": ${filas.length} registros importados.`;
+      if (sinProm) msg += ` ${sinProm} quedaron sin asignar.`;
+      if (noEnc.size) msg += ` Asesores no encontrados: ${[...noEnc].join(', ')} (créelos en Usuarios).`;
       toast(msg, 'ok');
       if (!S.periodos.includes(S.periodo)) S.periodos.unshift(S.periodo);
       await recargar();
-    } catch (e) { fail(e); }
+    } catch (e) { fail(e); btn.disabled = false; btn.textContent = `Importar a ${nombrePeriodo(S.periodo)}`; }
   };
 }
 
 // ================= Usuarios y catálogos (Jefe) =================
 async function viewConfig() {
-  const users = await api('GET', '/api/usuarios');
+  const users = await q(sb.from('perfiles').select('*').order('rol').order('nombre'));
   const nombres = { campana: 'Campañas', perfil: 'Perfil lead', tipificacion: 'Tipificaciones', estado: 'Estados', seguro: 'Seguros', tipo_base: 'Tipos de base' };
   $('#content').innerHTML = `
   <div class="grid g2">
@@ -805,7 +927,7 @@ async function viewConfig() {
       <div class="form-grid">${Object.entries(nombres).map(([k, l]) => `<div class="field"><label>${l}</label><textarea data-cat="${k}" rows="6">${esc((S.cat[k] || []).join('\n'))}</textarea>
         <button class="btn sm" data-catsave="${k}" style="align-self:flex-end">Guardar</button></div>`).join('')}</div></div></div>
   </div>`;
-  const reload = async () => { const me = await api('GET', '/api/me'); S.cat = me.catalogos; S.promotores = me.promotores; viewConfig(); };
+  const reload = async () => { await cargarPerfil(); viewConfig(); };
   $('#uNew').onclick = () => modal('Nuevo usuario', `
     <div class="field"><label>Nombre completo</label><input type="text" id="un"></div>
     <div class="field"><label>Usuario (para ingresar)</label><input type="text" id="uu" autocomplete="off"></div>
@@ -813,19 +935,19 @@ async function viewConfig() {
     <div class="field"><label>Contraseña temporal (mín. 8)</label><input type="text" id="up" autocomplete="off"></div>
     <p class="small muted" style="margin:0">Se le pedirá cambiarla al primer ingreso.</p>`,
   [{ label: 'Cancelar' }, { label: 'Crear', cls: 'primary', onClick: async (r) => {
-    await api('POST', '/api/usuarios', { nombre: $('#un', r).value, username: $('#uu', r).value, rol: $('#ur', r).value, password: $('#up', r).value });
+    await q(sb.rpc('crear_usuario', { p_username: $('#uu', r).value, p_nombre: $('#un', r).value, p_rol: $('#ur', r).value, p_password: $('#up', r).value }));
     toast('Usuario creado', 'ok'); setTimeout(reload);
   } }]);
-  $('#content').querySelectorAll('[data-ren]').forEach((b) => b.onclick = () => { const u = users.find((x) => x.id === Number(b.dataset.ren));
+  $('#content').querySelectorAll('[data-ren]').forEach((b) => b.onclick = () => { const u = users.find((x) => x.id === b.dataset.ren);
     modal('Renombrar usuario', `<div class="field"><label>Nombre</label><input type="text" id="rn" value="${esc(u.nombre)}"></div>`,
-      [{ label: 'Cancelar' }, { label: 'Guardar', cls: 'primary', onClick: async (r) => { await api('PUT', '/api/usuarios/' + u.id, { nombre: $('#rn', r).value }); setTimeout(reload); } }]); });
-  $('#content').querySelectorAll('[data-pw]').forEach((b) => b.onclick = () => { const u = users.find((x) => x.id === Number(b.dataset.pw));
+      [{ label: 'Cancelar' }, { label: 'Guardar', cls: 'primary', onClick: async (r) => { const n = $('#rn', r).value.trim(); if (!n) throw new Error('Indique el nombre'); await q(sb.from('perfiles').update({ nombre: n }).eq('id', u.id)); setTimeout(reload); } }]); });
+  $('#content').querySelectorAll('[data-pw]').forEach((b) => b.onclick = () => { const u = users.find((x) => x.id === b.dataset.pw);
     modal('Restablecer contraseña', `<p style="margin:0">Nueva contraseña temporal para <b>${esc(u.nombre)}</b>:</p><div class="field"><input type="text" id="np" autocomplete="off"></div>`,
-      [{ label: 'Cancelar' }, { label: 'Restablecer', cls: 'primary', onClick: async (r) => { await api('PUT', '/api/usuarios/' + u.id, { password: $('#np', r).value }); toast('Contraseña restablecida', 'ok'); setTimeout(reload); } }]); });
-  $('#content').querySelectorAll('[data-act]').forEach((b) => b.onclick = async () => { try { await api('PUT', '/api/usuarios/' + b.dataset.act, { activo: !!Number(b.dataset.v) }); reload(); } catch (e) { fail(e); } });
+      [{ label: 'Cancelar' }, { label: 'Restablecer', cls: 'primary', onClick: async (r) => { await q(sb.rpc('restablecer_clave', { p_id: u.id, p_password: $('#np', r).value })); toast('Contraseña restablecida', 'ok'); setTimeout(reload); } }]); });
+  $('#content').querySelectorAll('[data-act]').forEach((b) => b.onclick = async () => { try { await q(sb.from('perfiles').update({ activo: !!Number(b.dataset.v) }).eq('id', b.dataset.act)); reload(); } catch (e) { fail(e); } });
   $('#content').querySelectorAll('[data-catsave]').forEach((b) => b.onclick = async () => {
     const k = b.dataset.catsave; const valores = $(`[data-cat="${k}"]`).value.split('\n');
-    try { await api('PUT', '/api/catalogos/' + k, { valores }); toast('Catálogo guardado', 'ok'); reload(); } catch (e) { fail(e); }
+    try { await q(sb.rpc('guardar_catalogo', { p_tipo: k, p_valores: valores })); toast('Catálogo guardado', 'ok'); reload(); } catch (e) { fail(e); }
   });
 }
 

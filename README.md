@@ -1,38 +1,33 @@
 # CRM de Telemercadeo
 
-Aplicación web que reemplaza la "Tabla Madre" de Google Sheets y los archivos de cada promotor.
-Tiene dos perfiles:
+Aplicación web en línea (GitHub Pages + Supabase) que reemplaza la "Tabla Madre" y los archivos de cada promotor.
+Se abre en Google Chrome desde cualquier computadora: **https://camalgut-crypto.github.io/APP-DE-CALL-CENTER/**
 
 | Perfil | Qué ve |
 |---|---|
 | **Jefe de Telemercadeo** | Base General (pestaña del mes), Cálculo Desfase, Tablas, Campañas, Tabla Dinámica, **Distribución** (importar y repartir bases), Producción, Bases, Usuarios y catálogos |
 | **Promotor de Telemercadeo** | Mi Base (solo los leads asignados), **Gestión** (se abre al hacer clic en un lead, con las columnas azules), Producción y Bases |
 
-## Requisitos
+## Cómo está armado
 
-- Node.js 22.13 o superior (usa el SQLite integrado de Node; no requiere instalar base de datos).
+- `public/` — la página (HTML/CSS/JS). Cada `push` a `main` la publica en GitHub Pages (`.github/workflows/pages.yml`).
+- `supabase/schema.sql` — tablas, seguridad por rol (RLS) y funciones. El promotor solo puede ver y editar sus registros y solo las columnas de gestión; eso lo hace cumplir la base de datos, no la página.
+- `public/config.js` — URL del proyecto Supabase y su clave pública (anon/publishable). Es pública por diseño.
 
-## Instalación
+## Puesta en marcha (una sola vez)
 
-```bash
-npm install
-```
+1. Crear un proyecto en [supabase.com](https://supabase.com) y copiar la **Project URL** y la clave **anon public** en `public/config.js`.
+2. En Supabase › **SQL Editor**, pegar y ejecutar `supabase/schema.sql`.
+3. Generar la carga inicial desde los Excel y ejecutarla también en el SQL Editor:
 
-Carga inicial desde los Excel actuales (crea usuarios, importa la pestaña del mes y la hoja BASES de un promotor):
+   ```bash
+   npm install
+   npm run carga -- "C:/ruta/Tabla Madre Octubre 2026.xlsx" "C:/ruta/Luis Brenes.xlsx" "Luis Brenes" --periodo 2026-10
+   ```
 
-```bash
-npm run seed -- "C:/ruta/Tabla Madre Octubre 2026.xlsx" "C:/ruta/Luis Brenes.xlsx" "Luis Brenes" --periodo 2026-10
-```
-
-Las contraseñas iniciales quedan en `data/credenciales_iniciales.txt`. Cada usuario debe cambiarla en su primer ingreso.
-
-## Ejecutar
-
-```bash
-npm start
-```
-
-Abrir `http://localhost:3000`. Para que el equipo entre desde otras PCs, ejecutarlo en un servidor de la red y usar `http://<ip-del-servidor>:3000` (variable `PORT` para cambiar el puerto, `DATA_DIR` para la carpeta de la base de datos).
+   Crea `data/carga_inicial.sql` (para pegar en el SQL Editor) y `data/credenciales_iniciales.txt` con las contraseñas iniciales.
+   Ninguno de los dos se sube a Git.
+4. Recomendado: en Supabase › Authentication › Sign In / Providers, desactivar **Allow new users to sign up** (los usuarios los crea el Jefe desde la app).
 
 ## Flujo mensual
 
@@ -42,7 +37,15 @@ Abrir `http://localhost:3000`. Para que el equipo entre desde otras PCs, ejecuta
 4. Cada promotor gestiona sus leads: tipificación, estado, monto, fecha formalizado, seguro y comentarios. Todo cambio queda en el historial.
 5. Producción, Desfase, Tablas y Campañas se recalculan solas. **⬇ Excel** descarga el mes en el formato de la Tabla Madre.
 
-## Datos
+## Usuarios
 
-- La base de datos está en `data/telemercadeo.db` y **no se sube a Git** (contiene datos personales de clientes). Respáldela copiando esa carpeta.
-- Los Excel tampoco se versionan (`.gitignore`).
+Se ingresa con el **usuario** (por ejemplo `jefe` o `luis.brenes`), no con correo. El Jefe crea promotores, restablece
+contraseñas y desactiva usuarios en **Usuarios y catálogos**. Cada usuario debe cambiar su contraseña al primer ingreso.
+
+## Probar localmente
+
+```bash
+npm run dev
+```
+
+y abrir `http://localhost:3000` (usa el mismo Supabase configurado en `public/config.js`).

@@ -2,13 +2,11 @@
   "name": "app-call-center-telemercadeo",
   "version": "1.0.0",
   "private": true,
-  "description": "CRM de Telemercadeo: Jefe de Telemercadeo y Promotores",
-  "main": "server.js",
+  "description": "CRM de Telemercadeo (GitHub Pages + Supabase): Jefe de Telemercadeo y Promotores",
   "scripts": {
-    "start": "node --no-warnings server.js",
-    "seed": "node --no-warnings scripts/seed.js"
+    "carga": "node scripts/generar_carga_inicial.js",
+    "dev": "python -m http.server 3000 --directory public"
   },
-  "engines": { "node": ">=22.13" },
   "dependencies": {
     "xlsx": "0.18.5"
   }
