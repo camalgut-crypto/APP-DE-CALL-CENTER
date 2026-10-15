@@ -808,6 +808,11 @@ function viewDistribucion() {
     <div class="chips"><span class="chip ${esLeads ? 'on' : ''}" data-modo="leads">Leads del mes</span><span class="chip ${!esLeads ? 'on' : ''}" data-modo="bases">Bases precalificadas</span></div></div>
   <div class="grid" style="grid-template-columns:minmax(300px,380px) 1fr;align-items:start">
     <div class="grid">
+      ${esLeads && CFG.DRIVE_LEADS_SHEET ? `<div class="card"><div class="card-h"><h3>Leads del formulario web</h3><div class="spacer"></div><span class="small muted">Google Drive</span></div><div class="card-b">
+        <p class="small muted" style="margin-top:0">Trae los leads que llegaron al Drive en ${esc(nombrePeriodo(S.periodo))} y que aún no están en la base.
+          Campaña: <b>Google</b> si viene de anuncios de Google, <b>Organico</b> en los demás casos.</p>
+        <button class="btn primary" id="dDrive" style="width:100%;justify-content:center">⟳ Traer leads nuevos del Drive</button>
+        <div id="dDriveOut"></div></div></div>` : ''}
       <div class="card"><div class="card-h"><h3>1. Importar desde Excel</h3></div><div class="card-b">
         <div class="drop"><p style="margin:0 0 10px">${esLeads ? 'Archivo con columnas: <b>Fecha asignacion, Hora, Cédula, Número Celular, Correo, Campaña</b> (opcional: Asesor y columnas de gestión).'
           : 'Archivo con hoja <b>BASES</b>: BASE_PRECALIFICADOS, CEDULA, NOMBRE, TELEFONO, CORREO, TIPO_CREDITO_PATRONO, Salario…'}</p>
@@ -876,6 +881,7 @@ function viewDistribucion() {
     if (!(await confirmar('Quitar asignación', `Los ${d.sel.size} registros quedarán sin ejecutivo. ¿Continuar?`))) return;
     try { await asignar([...d.sel], null); await recargar(); } catch (e) { fail(e); }
   };
+  if ($('#dDrive')) $('#dDrive').onclick = () => traerDelDrive(recargar).catch((e) => { fail(e); $('#dDrive').disabled = false; });
   $('#dImp').onclick = async () => {
     const file = $('#dFile').files[0]; if (!file) return toast('Seleccione un archivo Excel', 'error');
     const repl = esLeads && $('#dRepl').checked;
@@ -907,6 +913,54 @@ function viewDistribucion() {
       if (!S.periodos.includes(S.periodo)) S.periodos.unshift(S.periodo);
       await recargar();
     } catch (e) { fail(e); btn.disabled = false; btn.textContent = `Importar a ${nombrePeriodo(S.periodo)}`; }
+  };
+}
+
+// ================= Leads del formulario web (Google Drive) =================
+// La hoja debe estar compartida como "Cualquier persona con el enlace puede ver".
+// Se consulta con la API de visualización de Google, filtrando por fecha (columna A) en el servidor.
+async function traerDelDrive(recargar) {
+  const btn = $('#dDrive'); btn.disabled = true; btn.textContent = 'Consultando el Drive…';
+  const y = Number(S.periodo.slice(0, 4)), m = Number(S.periodo.slice(5));
+  const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const desde = iso(new Date(y, m - 1, 1)), hasta = iso(new Date(y, m, 0));
+  const tq = `select * where A >= date '${desde}' and A <= date '${hasta}'`;
+  const url = `https://docs.google.com/spreadsheets/d/${CFG.DRIVE_LEADS_SHEET}/gviz/tq?tqx=out:csv&gid=${CFG.DRIVE_LEADS_GID || 0}&tq=${encodeURIComponent(tq)}`;
+  const r = await fetch(url);
+  const texto = await r.text();
+  if (!r.ok || /^\s*</.test(texto)) throw new Error('No se pudo leer la hoja del Drive. Verifique que esté compartida como "Cualquier persona con el enlace".');
+  const filas = XLSX.utils.sheet_to_json(XLSX.read(texto, { type: 'string', raw: true }).Sheets.Sheet1, { defval: '', raw: false });
+  // Cédulas y teléfonos ya cargados en este periodo y en el anterior
+  const prev = iso(new Date(y, m - 2, 1)).slice(0, 7);
+  const exist = await fetchAll(() => sb.from('leads').select('cedula,celular').in('periodo', [S.periodo, prev]));
+  const clave = (c) => String(c || '').toUpperCase().replace(/[^0-9A-Z]/g, '');
+  const ya = new Set(exist.flatMap((l) => [clave(l.cedula), 'T' + clave(l.celular)]).filter((k) => k && k !== 'T'));
+  const campana = (src) => { const s = norm(src); return /google/.test(s) ? 'Google' : /facebook|instagram|meta|fb|ig/.test(s) ? 'Meta' : 'Organico'; };
+  const nuevos = []; let repetidos = 0;
+  for (const f of filas) {
+    const ced = clave(f.cedula), tel = clave(f.telefono);
+    if (!ced && !tel) continue;
+    if ((ced && ya.has(ced)) || (tel && ya.has('T' + tel))) { repetidos++; continue; }
+    if (ced) ya.add(ced); if (tel) ya.add('T' + tel);
+    const hm = String(f.time || '').match(/(\d{1,2}):(\d{2})/);
+    nuevos.push({ periodo: S.periodo, fecha_asignacion: /^\d{4}-\d{2}-\d{2}/.test(f.fecha) ? f.fecha.slice(0, 10) : null,
+      hora: hm ? `${hm[1].padStart(2, '0')}:${hm[2]}` : null, cedula: String(f.cedula || '').trim().toUpperCase() || null,
+      celular: String(f.telefono || '').trim() || null, correo: String(f.correoElectronico || '').trim() || null, campana: campana(f.utm_source) });
+  }
+  btn.disabled = false; btn.textContent = '⟳ Traer leads nuevos del Drive';
+  const out = $('#dDriveOut');
+  if (!nuevos.length) { out.innerHTML = `<p class="small" style="margin:10px 0 0">No hay leads nuevos. ${filas.length} en el Drive del ${fdate(desde)} al ${fdate(hasta)}, ${repetidos} ya estaban en la base.</p>`; return; }
+  out.innerHTML = `<p class="small" style="margin:10px 0 6px"><b>${nuevos.length} leads nuevos</b> · ${repetidos} ya estaban en la base.</p>
+    <div class="tbl-wrap free" style="max-height:220px"><table class="tbl-compact"><thead><tr><th>Fecha</th><th>Hora</th><th>Cédula</th><th>Celular</th><th>Campaña</th></tr></thead>
+    <tbody>${nuevos.map((n) => `<tr><td>${esc(fdate(n.fecha_asignacion))}</td><td>${esc(n.hora || '')}</td><td>${esc(n.cedula || '')}</td><td>${esc(n.celular || '')}</td><td>${esc(n.campana)}</td></tr>`).join('')}</tbody></table></div>
+    <button class="btn azul" id="dDriveOk" style="margin-top:8px;width:100%;justify-content:center">Agregar ${nuevos.length} a ${esc(nombrePeriodo(S.periodo))} (sin asignar)</button>`;
+  $('#dDriveOk').onclick = async () => {
+    try {
+      $('#dDriveOk').disabled = true;
+      for (const c of chunks(nuevos, 500)) await q(sb.from('leads').insert(c));
+      toast(`${nuevos.length} leads agregados. Ahora selecciónelos y repártalos.`, 'ok');
+      S.f.dist.ver = 'sin'; await recargar();
+    } catch (e) { fail(e); $('#dDriveOk').disabled = false; }
   };
 }
 
